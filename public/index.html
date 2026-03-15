@@ -141,6 +141,7 @@ let filterNode = null;
 let currentMidi = -1;
 let wakeLock = null;
 let roomCode = null;
+let myId = null;
 let intentionalClose = false;
 let reconnectAttempts = 0;
 const MAX_RECONNECT = 10;
@@ -435,6 +436,7 @@ function connectWebSocket(code, isReconnect) {
 
     if (msg.t === 'joined') {
       roomCode = msg.code;
+      myId = msg.id;
       document.getElementById('joinScreen').style.display = 'none';
       document.getElementById('singScreen').style.display = 'block';
       updatePartDisplay();
@@ -454,15 +456,17 @@ function connectWebSocket(code, isReconnect) {
       }
 
     } else if (msg.t === 'n') {
-      const partKey = { soprano: 's', alto: 'a', tenor: 'e', bass: 'b' }[selectedPart];
-      const midi = msg[partKey];
-      playNote(midi);
-      updateNoteDisplay(midi);
+      const midi = msg.notes[myId];
+      if (midi !== undefined) {
+        playNote(midi);
+        updateNoteDisplay(midi);
+      }
 
     } else if (msg.t === 'r') {
-      const c = msg.singers;
+      const counts = {soprano: 0, alto: 0, tenor: 0, bass: 0};
+      for (const s of msg.singers) counts[s.part] = (counts[s.part] || 0) + 1;
       document.getElementById('singerCounts').textContent =
-        `S:${c.soprano||0}  A:${c.alto||0}  T:${c.tenor||0}  B:${c.bass||0}`;
+        `S:${counts.soprano}  A:${counts.alto}  T:${counts.tenor}  B:${counts.bass}`;
 
     } else if (msg.t === 'ended') {
       intentionalClose = true;

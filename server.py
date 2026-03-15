@@ -37,10 +37,8 @@ def generate_code():
 
 
 def broadcast_room_state(room, code):
-    counts = {"soprano": 0, "alto": 0, "tenor": 0, "bass": 0}
-    for info in room["singers"].values():
-        counts[info["part"]] = counts.get(info["part"], 0) + 1
-    msg = json.dumps({"t": "r", "code": code, "singers": counts})
+    singer_list = [{"id": info["id"], "part": info["part"]} for info in room["singers"].values()]
+    msg = json.dumps({"t": "r", "code": code, "singers": singer_list})
     targets = list(room["singers"].keys())
     if room["conductor"]:
         targets.append(room["conductor"])
@@ -106,10 +104,10 @@ async def handler(websocket):
                     if code in rooms:
                         rooms[code]["conductor"] = websocket
                     else:
-                        rooms[code] = {"conductor": websocket, "singers": {}}
+                        rooms[code] = {"conductor": websocket, "singers": {}, "next_id": 0}
                 else:
                     code = generate_code()
-                    rooms[code] = {"conductor": websocket, "singers": {}}
+                    rooms[code] = {"conductor": websocket, "singers": {}, "next_id": 0}
                 my_room = rooms[code]
                 my_code = code
                 my_role = "conductor"
@@ -123,16 +121,18 @@ async def handler(websocket):
                 if not room:
                     if TEST_MODE:
                         # Auto-create room if conductor hasn't connected yet
-                        rooms[code] = {"conductor": None, "singers": {}}
+                        rooms[code] = {"conductor": None, "singers": {}, "next_id": 0}
                         room = rooms[code]
                     else:
                         await websocket.send(json.dumps({"t": "error", "msg": "Room not found"}))
                         continue
-                room["singers"][websocket] = {"part": msg.get("part", "soprano")}
+                room["next_id"] = room.get("next_id", 0) + 1
+                singer_id = room["next_id"]
+                room["singers"][websocket] = {"id": singer_id, "part": msg.get("part", "soprano")}
                 my_room = room
                 my_code = code
                 my_role = "singer"
-                await websocket.send(json.dumps({"t": "joined", "code": code}))
+                await websocket.send(json.dumps({"t": "joined", "code": code, "id": singer_id}))
                 broadcast_room_state(room, code)
 
             elif t in ("n", "syl", "vol") and my_role == "conductor" and my_room:

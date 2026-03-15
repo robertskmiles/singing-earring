@@ -164,7 +164,7 @@ let ws = null;
 let midiAccess = null;
 let currentInput = null;
 let heldNotes = new Set();
-let singerCounts = { soprano: 0, alto: 0, tenor: 0, bass: 0 };
+let singers = []; // [{id, part}, ...]
 
 // Sustain mode
 let sustainMode = false;
@@ -230,7 +230,7 @@ function stopVolHold() {
 }
 
 // Track last-sent voice assignments for master display
-let lastVoices = { soprano: -1, alto: -1, tenor: -1, bass: -1 };
+let lastAssignments = {}; // {singerId: midi, ...}
 let masterPulseTimer = null;
 
 function noteName(midi) {
@@ -249,12 +249,16 @@ function anyPartPulsing() {
 }
 
 function updateMasterDisplay() {
-  // Update note names only — pulse timer is independent
+  // Show all unique notes per voice type
   for (const part of ['bass', 'tenor', 'alto', 'soprano']) {
-    const note = lastVoices[part];
-    document.getElementById('note' + PART_SUFFIXES[part]).textContent = note >= 0 ? noteName(note) : '';
+    const partSingers = singers.filter(s => s.part === part);
+    const notes = partSingers
+      .map(s => lastAssignments[s.id])
+      .filter(m => m !== undefined && m >= 0);
+    const unique = [...new Set(notes)].sort((a, b) => a - b);
+    document.getElementById('note' + PART_SUFFIXES[part]).textContent =
+      unique.map(noteName).join(' ');
   }
-  // Update non-pulsing parts' syllable text immediately
   updateMasterSyllables();
 }
 
@@ -319,90 +323,192 @@ function fitToRange(note, part) {
   return note;
 }
 
-// Voice assignment: distribute parts evenly across notes, lower parts on lower notes
-function assignVoices(notes) {
-  if (notes.length === 0) return { soprano: -1, alto: -1, tenor: -1, bass: -1 };
+// Minimum-cost assignment via Hungarian algorithm (O(n^3))
+function hungarian(cost) {
+  const n = cost.length;
+  const u = new Array(n + 1).fill(0);
+  const v = new Array(n + 1).fill(0);
+  const p = new Array(n + 1).fill(0);
+  const way = new Array(n + 1).fill(0);
+  for (let i = 1; i <= n; i++) {
+    p[0] = i;
+    let j0 = 0;
+    const minv = new Array(n + 1).fill(Infinity);
+    const used = new Array(n + 1).fill(false);
+    do {
+      used[j0] = true;
+      let i0 = p[j0], delta = Infinity, j1;
+      for (let j = 1; j <= n; j++) {
+        if (!used[j]) {
+          const cur = cost[i0 - 1][j - 1] - u[i0] - v[j];
+          if (cur < minv[j]) { minv[j] = cur; way[j] = j0; }
+          if (minv[j] < delta) { delta = minv[j]; j1 = j; }
+        }
+      }
+      for (let j = 0; j <= n; j++) {
+        if (used[j]) { u[p[j]] += delta; v[j] -= delta; }
+        else { minv[j] -= delta; }
+      }
+      j0 = j1;
+    } while (p[j0] !== 0);
+    do { const j1 = way[j0]; p[j0] = p[j1]; j0 = j1; } while (j0);
+  }
+  const result = new Array(n);
+  for (let j = 1; j <= n; j++) result[p[j] - 1] = j - 1;
+  return result;
+}
 
-  const sorted = [...notes].sort((a, b) => a - b);
-  const activeParts = PARTS.filter(p => (singerCounts[p] || 0) > 0);
-  const partsToAssign = activeParts.length > 0 ? activeParts : PARTS;
-  const partsByRange = [...partsToAssign].sort((a, b) => RANGE_MID[a] - RANGE_MID[b]);
-  const result = { soprano: -1, alto: -1, tenor: -1, bass: -1 };
-  const n = sorted.length, p = partsByRange.length;
+// Stateless voice assignment (used for first chord / no previous state)
+function assignVoicesStateless(sorted) {
+  const result = {};
+  const sortedSingers = [...singers].sort((a, b) => RANGE_MID[a.part] - RANGE_MID[b.part]);
+  const n = sorted.length, p = sortedSingers.length;
 
   if (n >= p) {
-    // More notes than parts: spread parts proportionally across notes
-    for (let pi = 0; pi < p; pi++) {
-      const ni = Math.round(pi * (n - 1) / (p - 1 || 1));
-      result[partsByRange[pi]] = fitToRange(sorted[ni], partsByRange[pi]);
+    for (let si = 0; si < p; si++) {
+      const ni = Math.round(si * (n - 1) / (p - 1 || 1));
+      result[sortedSingers[si].id] = fitToRange(sorted[ni], sortedSingers[si].part);
     }
   } else {
-    // More parts than notes: distribute evenly, lower parts on lower notes
     const base = Math.floor(p / n);
     const remainder = p % n;
-    let partIdx = 0;
+    let singerIdx = 0;
     for (let ni = 0; ni < n; ni++) {
       const count = base + (ni < remainder ? 1 : 0);
       for (let j = 0; j < count; j++) {
-        const part = partsByRange[partIdx];
-        result[part] = fitToRange(sorted[ni], part);
-        partIdx++;
+        const singer = sortedSingers[singerIdx];
+        result[singer.id] = fitToRange(sorted[ni], singer.part);
+        singerIdx++;
+      }
+    }
+  }
+  return result;
+}
+
+// Voice-leading assignment: minimize total semitone movement from previous chord
+function assignVoicesVoiceLeading(sorted) {
+  const result = {};
+  const p = singers.length;
+
+  // Build note slots — when more singers than notes, duplicate slots
+  let slots;
+  if (sorted.length >= p) {
+    slots = sorted;
+  } else {
+    slots = [];
+    const base = Math.floor(p / sorted.length);
+    const remainder = p % sorted.length;
+    for (let i = 0; i < sorted.length; i++) {
+      const count = base + (i < remainder ? 1 : 0);
+      for (let j = 0; j < count; j++) slots.push(sorted[i]);
+    }
+  }
+
+  // Pad to square matrix
+  const N = Math.max(p, slots.length);
+  const cost = [];
+  for (let i = 0; i < N; i++) {
+    cost[i] = new Array(N);
+    for (let j = 0; j < N; j++) {
+      if (i >= p || j >= slots.length) {
+        cost[i][j] = 1000; // dummy row/column
+      } else {
+        const singer = singers[i];
+        const fitted = fitToRange(slots[j], singer.part);
+        const prev = lastAssignments[singer.id];
+        cost[i][j] = (prev !== undefined && prev >= 0)
+          ? Math.abs(prev - fitted)
+          : Math.abs(RANGE_MID[singer.part] - fitted);
       }
     }
   }
 
+  const assignment = hungarian(cost);
+
+  for (let i = 0; i < p; i++) {
+    const j = assignment[i];
+    if (j < slots.length) {
+      result[singers[i].id] = fitToRange(slots[j], singers[i].part);
+    } else {
+      // Fallback: assign to closest note
+      const singer = singers[i];
+      const prev = lastAssignments[singer.id];
+      let best = sorted[0], bestDist = Infinity;
+      for (const note of sorted) {
+        const fitted = fitToRange(note, singer.part);
+        const dist = (prev >= 0) ? Math.abs(prev - fitted) : Math.abs(RANGE_MID[singer.part] - fitted);
+        if (dist < bestDist) { bestDist = dist; best = note; }
+      }
+      result[singer.id] = fitToRange(best, singer.part);
+    }
+  }
   return result;
+}
+
+// Voice assignment: uses voice leading when previous state exists, otherwise stateless
+function assignVoices(notes) {
+  const result = {};
+  if (singers.length === 0) return result;
+
+  if (notes.length === 0) {
+    for (const s of singers) result[s.id] = -1;
+    return result;
+  }
+
+  const sorted = [...notes].sort((a, b) => a - b);
+  const hasPrevious = singers.some(s => lastAssignments[s.id] !== undefined && lastAssignments[s.id] >= 0);
+
+  if (!hasPrevious) return assignVoicesStateless(sorted);
+  return assignVoicesVoiceLeading(sorted);
 }
 
 function updateDisplay() {
   const notes = [...heldNotes].sort((a, b) => a - b);
 
   if (notes.length === 0) {
-    if (ws && ws.readyState === 1) {
-      ws.send(JSON.stringify({ t: 'n', s: -1, a: -1, e: -1, b: -1 }));
+    const silentAssignments = {};
+    for (const s of singers) silentAssignments[s.id] = -1;
+    if (ws && ws.readyState === 1 && singers.length > 0) {
+      ws.send(JSON.stringify({ t: 'n', notes: silentAssignments }));
     }
-    lastVoices = { soprano: -1, alto: -1, tenor: -1, bass: -1 };
+    lastAssignments = silentAssignments;
     updateMasterDisplay();
     document.querySelectorAll('.key').forEach(k => { k.style.background = ''; });
     return;
   }
 
-  const voices = assignVoices(notes);
-  lastVoices = { ...voices };
+  const assignments = assignVoices(notes);
+  lastAssignments = { ...assignments };
 
-  if (ws && ws.readyState === 1) {
-    ws.send(JSON.stringify({
-      t: 'n',
-      s: voices.soprano,
-      a: voices.alto,
-      e: voices.tenor,
-      b: voices.bass,
-    }));
+  if (ws && ws.readyState === 1 && singers.length > 0) {
+    ws.send(JSON.stringify({ t: 'n', notes: assignments }));
   }
 
   updateMasterDisplay();
 
-  // Color piano keys by assigned part
+  // Color piano keys by voice type
   document.querySelectorAll('.key').forEach(k => {
     const midi = parseInt(k.dataset.midi);
     const isBlack = k.classList.contains('black');
     if (!heldNotes.has(midi)) { k.style.background = ''; return; }
 
-    const partsOnKey = [];
-    for (const part of ['soprano','alto','tenor','bass']) {
-      if (voices[part] >= 0 && voices[part] % 12 === midi % 12) {
-        partsOnKey.push(part);
+    const partsOnKey = new Set();
+    for (const singer of singers) {
+      const assigned = lastAssignments[singer.id];
+      if (assigned >= 0 && assigned % 12 === midi % 12) {
+        partsOnKey.add(singer.part);
       }
     }
 
-    if (partsOnKey.length === 0) {
+    const parts = [...partsOnKey];
+    if (parts.length === 0) {
       k.style.background = isBlack ? '#c23152' : '#e94560';
-    } else if (partsOnKey.length === 1) {
-      k.style.background = PART_COLORS[partsOnKey[0]];
+    } else if (parts.length === 1) {
+      k.style.background = PART_COLORS[parts[0]];
     } else {
-      const stops = partsOnKey.map((p, i) => {
-        const pct1 = (i / partsOnKey.length * 100).toFixed(1);
-        const pct2 = ((i + 1) / partsOnKey.length * 100).toFixed(1);
+      const stops = parts.map((p, i) => {
+        const pct1 = (i / parts.length * 100).toFixed(1);
+        const pct2 = ((i + 1) / parts.length * 100).toFixed(1);
         return `${PART_COLORS[p]} ${pct1}%, ${PART_COLORS[p]} ${pct2}%`;
       }).join(', ');
       k.style.background = `linear-gradient(to right, ${stops})`;
@@ -441,37 +547,39 @@ function getTargetParts() {
 }
 
 function updateSustainDisplay() {
-  const voices = {
-    soprano: sustainedNotes.soprano >= 0 ? fitToRange(sustainedNotes.soprano, 'soprano') : -1,
-    alto: sustainedNotes.alto >= 0 ? fitToRange(sustainedNotes.alto, 'alto') : -1,
-    tenor: sustainedNotes.tenor >= 0 ? fitToRange(sustainedNotes.tenor, 'tenor') : -1,
-    bass: sustainedNotes.bass >= 0 ? fitToRange(sustainedNotes.bass, 'bass') : -1,
-  };
+  // Build per-singer assignments from per-voice-type sustained notes
+  const assignments = {};
+  for (const singer of singers) {
+    const sustained = sustainedNotes[singer.part];
+    assignments[singer.id] = sustained >= 0 ? fitToRange(sustained, singer.part) : -1;
+  }
 
-  lastVoices = { ...voices };
+  lastAssignments = { ...assignments };
 
-  if (ws && ws.readyState === 1) {
-    ws.send(JSON.stringify({ t: 'n', s: voices.soprano, a: voices.alto, e: voices.tenor, b: voices.bass }));
+  if (ws && ws.readyState === 1 && singers.length > 0) {
+    ws.send(JSON.stringify({ t: 'n', notes: assignments }));
   }
 
   updateMasterDisplay();
 
   document.querySelectorAll('.key').forEach(k => {
     const midi = parseInt(k.dataset.midi);
-    const partsOnKey = [];
-    for (const part of ['soprano','alto','tenor','bass']) {
-      if (voices[part] === midi) {
-        partsOnKey.push(part);
+    const partsOnKey = new Set();
+    for (const singer of singers) {
+      const assigned = lastAssignments[singer.id];
+      if (assigned !== undefined && assigned === midi) {
+        partsOnKey.add(singer.part);
       }
     }
-    if (partsOnKey.length === 0) {
+    const parts = [...partsOnKey];
+    if (parts.length === 0) {
       k.style.background = '';
-    } else if (partsOnKey.length === 1) {
-      k.style.background = PART_COLORS[partsOnKey[0]];
+    } else if (parts.length === 1) {
+      k.style.background = PART_COLORS[parts[0]];
     } else {
-      const stops = partsOnKey.map((p, i) => {
-        const pct1 = (i / partsOnKey.length * 100).toFixed(1);
-        const pct2 = ((i + 1) / partsOnKey.length * 100).toFixed(1);
+      const stops = parts.map((p, i) => {
+        const pct1 = (i / parts.length * 100).toFixed(1);
+        const pct2 = ((i + 1) / parts.length * 100).toFixed(1);
         return `${PART_COLORS[p]} ${pct1}%, ${PART_COLORS[p]} ${pct2}%`;
       }).join(', ');
       k.style.background = `linear-gradient(to right, ${stops})`;
@@ -658,12 +766,15 @@ function createRoom() {
       sendSyllable();
       sendVolume();
     } else if (msg.t === 'r') {
-      singerCounts = msg.singers;
-      document.getElementById('countS').textContent = singerCounts.soprano || 0;
-      document.getElementById('countA').textContent = singerCounts.alto || 0;
-      document.getElementById('countT').textContent = singerCounts.tenor || 0;
-      document.getElementById('countB').textContent = singerCounts.bass || 0;
-      if (heldNotes.size > 0) updateDisplay();
+      singers = msg.singers || [];
+      const counts = {soprano: 0, alto: 0, tenor: 0, bass: 0};
+      for (const s of singers) counts[s.part] = (counts[s.part] || 0) + 1;
+      document.getElementById('countS').textContent = counts.soprano;
+      document.getElementById('countA').textContent = counts.alto;
+      document.getElementById('countT').textContent = counts.tenor;
+      document.getElementById('countB').textContent = counts.bass;
+      if (sustainMode) { updateSustainDisplay(); }
+      else if (heldNotes.size > 0) { updateDisplay(); }
     }
   };
   ws.onclose = () => { document.getElementById('status').textContent = 'Disconnected'; };
